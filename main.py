@@ -2,13 +2,14 @@ import os
 import json
 import asyncio
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart ,Command
 from aiogram.types import Message, CallbackQuery
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+
 
 from dotenv import load_dotenv
 
@@ -27,6 +28,12 @@ WALL_COLOR = {
     "8242": "🟧",
 }
 
+STATUS_LABELS = {
+    "ok": "работает",
+    "warn": "условно работает",
+    "bad": "не работает",
+    "unknown": "нет данных",
+}
 
 # Statuses: (label, key)
 STATUSES = [
@@ -63,6 +70,102 @@ def log_status(elevator_id: str, status_key: str, user) -> None:
     log_path = LOG_DIR / f"{elevator_id}.log"
     with log_path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+def parse_events_for_elevator(elevator_id: str) -> list[tuple[datetime, str]]:
+    log_path = LOG_DIR / f"{elevator_id}.log"
+    if not log_path.exists():
+        return []
+    events = []
+    with log_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                ts = datetime.fromisoformat(rec["ts"])
+                st = rec["status"]
+                if st not in ("ok", "warn", "bad"):
+                    continue
+                events.append((ts, st))
+            except Exception:
+                continue
+    events.sort(key=lambda x: x[0])
+    return events
+
+
+def format_duration(seconds: int) -> str:
+    minutes = seconds // 60
+    h = minutes // 60
+    m = minutes % 60
+    if h == 0:
+        return f"{m}м"
+    return f"{h}ч {m}м"
+
+
+def compute_uptime(elevator_id: str, start: datetime, end: datetime) -> dict[str, int]:
+    # returns seconds per status in the interval [start, end)
+    events = parse_events_for_elevator(elevator_id)
+    if start >= end:
+        return {"ok": 0, "warn": 0, "bad": 0, "unknown": 0}
+
+    # Find last status before start
+    current_status = "unknown"
+    for ts, st in events:
+        if ts < start:
+            current_status = st
+        else:
+            break
+
+    # Iterate events within [start, end)
+    totals = {"ok": 0, "warn": 0, "bad": 0, "unknown": 0}
+    cursor = start
+
+    for ts, st in events:
+        if ts < start:
+            continue
+        if ts >= end:
+            break
+
+        seg_end = ts
+        if seg_end > cursor:
+            totals[current_status] += int((seg_end - cursor).total_seconds())
+        current_status = st
+        cursor = ts
+
+    # Tail segment to end
+    if end > cursor:
+        totals[current_status] += int((end - cursor).total_seconds())
+
+    return totals
+
+
+def render_report_block(elevator_id: str, totals: dict[str, int]) -> str:
+    known_total = totals["ok"] + totals["warn"] + totals["bad"]
+    full_total = known_total + totals["unknown"]
+
+    if full_total == 0:
+        return f"Лифт {elevator_id}:\nнет данных\n"
+
+    # Если неизвестного времени нет — проценты считаем по known_total.
+    # Если есть — считаем по full_total и добавляем строку "нет данных".
+    denom = full_total if totals["unknown"] > 0 else known_total
+    if denom == 0:
+        denom = full_total  # на всякий
+
+    def pct(sec: int) -> int:
+        return round(sec * 100 / denom) if denom else 0
+
+    lines = [f"Лифт {elevator_id}:"]
+    lines.append(f"{STATUS_LABELS['ok']} = {format_duration(totals['ok'])} ({pct(totals['ok'])}%)")
+    lines.append(f"{STATUS_LABELS['warn']} = {format_duration(totals['warn'])} ({pct(totals['warn'])}%)")
+    lines.append(f"{STATUS_LABELS['bad']} = {format_duration(totals['bad'])} ({pct(totals['bad'])}%)")
+
+    if totals["unknown"] > 0:
+        lines.append(f"{STATUS_LABELS['unknown']} = {format_duration(totals['unknown'])} ({pct(totals['unknown'])}%)")
+
+    return "\n".join(lines) + "\n"
+
 
 def elevators_keyboard():
     kb = InlineKeyboardBuilder()
@@ -102,6 +205,16 @@ def statuses_keyboard(elevator_id: str):
         kb.button(text=label, callback_data=f"s:{elevator_id}:{key}")
     kb.adjust(1, 1, 1)
     return kb.as_markup()
+
+def report_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="24h", callback_data="r:24h")
+    kb.button(text="7d", callback_data="r:7d")
+    kb.button(text="30d", callback_data="r:30d")
+    kb.button(text="all", callback_data="r:all")
+    kb.adjust(2, 2)
+    return kb.as_markup()
+
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -256,7 +369,51 @@ async def confirm_status(callback: CallbackQuery):
 
     await callback.answer()
 
+@dp.message(Command("report"))
+async def report_cmd(message: Message):
+    await message.answer("Выбери период отчёта:", reply_markup=report_keyboard())
 
+@dp.callback_query(F.data.startswith("r:"))
+async def report_pick(callback: CallbackQuery):
+    data = callback.data or ""
+    period = data.split(":", 1)[1] if ":" in data else "24h"
+
+    end = datetime.now()
+    if period == "24h":
+        start = end - timedelta(hours=24)
+        title = "за 24 часа"
+    elif period == "7d":
+        start = end - timedelta(days=7)
+        title = "за 7 дней"
+    elif period == "30d":
+        start = end - timedelta(days=30)
+        title = "за 30 дней"
+    elif period == "all":
+        # Считаем от первого события по каждому лифту; общий start берём как min из первых событий
+        firsts = []
+        for e in ELEVATORS:
+            ev = parse_events_for_elevator(e)
+            if ev:
+                firsts.append(ev[0][0])
+        start = min(firsts) if firsts else end
+        title = "за всё время"
+    else:
+        await callback.answer("Неизвестный период", show_alert=True)
+        return
+
+    blocks = [f"Отчёт {title}\n"]
+    for e in ELEVATORS:
+        totals = compute_uptime(e, start, end)
+        blocks.append(render_report_block(e, totals))
+
+    text = "\n".join(blocks).strip()
+    msg = callback.message
+    if msg is None:
+        await callback.answer()
+        return
+
+    await msg.edit_text(text) # type: ignore
+    await callback.answer()
     
 
 def get_last_statuses(elevator_id: str, n: int = 2) -> list[str]:
